@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Broma
+Comment=Low-overhead soundboard for gamers
+Exec=broma
+Icon=io.github.s1codes.broma
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=sound;soundboard;audio;gaming;
+StartupWMClass=Broma

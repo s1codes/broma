@@ -1,0 +1,56 @@
+app-id: io.github.s1codes.broma
+runtime: org.freedesktop.Platform
+runtime-version: "26.08"
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: broma
+
+finish-args:
+  - --socket=wayland
+  - --socket=pulseaudio
+  - --device=all
+  - --talk-name=org.freedesktop.portal.Desktop
+  - --talk-name=org.kde.StatusNotifierWatcher
+  - --talk-name=org.freedesktop.StatusNotifierWatcher
+  - --own-name=org.kde.StatusNotifierItem-*
+
+modules:
+  - name: broma
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/broma/cargo
+        CARGO_NET_OFFLINE: "true"
+    build-commands:
+      - cargo --offline fetch --locked --manifest-path Cargo.toml
+      - |
+        RUST_TARGET="$(rustc -vV | sed -n 's/^host: //p')"
+        cargo build --offline --locked --release --target "$RUST_TARGET"
+        install -Dm0755 "target/$RUST_TARGET/release/broma" /app/bin/broma
+      - install -Dm0644 io.github.s1codes.broma.desktop /app/share/applications/io.github.s1codes.broma.desktop
+      - install -Dm0644 broma.svg /app/share/icons/hicolor/scalable/apps/io.github.s1codes.broma.svg
+      - install -Dm0644 io.github.s1codes.broma.metainfo.xml /app/share/metainfo/io.github.s1codes.broma.metainfo.xml
+      - install -Dm0644 LICENSE /app/share/licenses/io.github.s1codes.broma/LICENSE
+    sources:
+      - type: file
+        path: ../../../Cargo.toml
+      - type: file
+        path: ../../../Cargo.lock
+      - type: dir
+        path: ../../../src
+        dest: src
+      - type: file
+        path: ../../../LICENSE
+      - type: file
+        path: ../shared/io.github.s1codes.broma.desktop
+      - type: file
+        path: ../../../assets/broma.svg
+      - type: file
+        path: ../shared/io.github.s1codes.broma.metainfo.xml
+      - cargo-sources.json
+      - type: shell
+        commands:
+          - mkdir -p .cargo
+          - cp cargo/config .cargo/config.toml

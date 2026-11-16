@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.s1codes.broma</id>
+  <name>Broma</name>
+  <summary>Low-overhead soundboard for gamers</summary>
+  <developer id="io.github.s1codes">
+    <name>Sayantan Banerjee</name>
+  </developer>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>BSD-3-Clause</project_license>
+  <content_rating type="oars-1.1"/>
+  <description>
+    <p>
+        Guilt free and efficient Soundboard
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.s1codes.broma.desktop</launchable>
+  <provides>
+    <binary>broma</binary>
+  </provides>
+</component>
