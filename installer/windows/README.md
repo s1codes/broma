@@ -59,9 +59,9 @@ makensis \
   installer/windows/broma.nsi
 ```
 
-## Replacing the Placeholder Icon
+## Customizing the Application Icon
 
-`assets/broma.ico` is a placeholder `#3B82F6` square icon containing `16x16`, `32x32`, `48x48`, and `256x256` frames.
+The Windows installer embeds `assets/broma.ico` (a multi-resolution `.ico` containing the Broma logo).
 To use custom artwork, replace `assets/broma.ico` with your multi-resolution `.ico` file and re-run `build-installer.ps1`.
 
 ## Installer Behavior

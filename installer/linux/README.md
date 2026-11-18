@@ -18,9 +18,6 @@ Packagers are separated by format:
 - `build-packages.sh` builds both native package formats for the selected CPU
   architecture.
 
-`assets/broma.svg` is a placeholder; replace it with the approved Broma mark
-when its final export is available.
-
 The supported Rust targets are `x86_64-unknown-linux-gnu` and
 `aarch64-unknown-linux-gnu`. Debian names these architectures `amd64` and
 `arm64`; RPM names them `x86_64` and `aarch64`.

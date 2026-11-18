@@ -39,8 +39,9 @@ fn main() -> iced::Result {
 }
 
 pub fn main_window_settings() -> window::Settings {
-    let (rgba, width, height) = tray::default_icon_rgba();
-    let icon = window::icon::from_rgba(rgba, width, height).ok();
+    let icon = tray::default_icon_rgba()
+        .ok()
+        .and_then(|(rgba, width, height)| window::icon::from_rgba(rgba, width, height).ok());
 
     window::Settings {
         size: Size::new(820.0, 620.0),

@@ -30,7 +30,7 @@ modules:
         cargo build --offline --locked --release --target "$RUST_TARGET"
         install -Dm0755 "target/$RUST_TARGET/release/broma" /app/bin/broma
       - install -Dm0644 io.github.s1codes.broma.desktop /app/share/applications/io.github.s1codes.broma.desktop
-      - install -Dm0644 broma.svg /app/share/icons/hicolor/scalable/apps/io.github.s1codes.broma.svg
+      - install -Dm0644 assets/broma.svg /app/share/icons/hicolor/scalable/apps/io.github.s1codes.broma.svg
       - install -Dm0644 io.github.s1codes.broma.metainfo.xml /app/share/metainfo/io.github.s1codes.broma.metainfo.xml
       - install -Dm0644 LICENSE /app/share/licenses/io.github.s1codes.broma/LICENSE
     sources:
@@ -45,8 +45,9 @@ modules:
         path: ../../../LICENSE
       - type: file
         path: ../shared/io.github.s1codes.broma.desktop
-      - type: file
-        path: ../../../assets/broma.svg
+      - type: dir
+        path: ../../../assets
+        dest: assets
       - type: file
         path: ../shared/io.github.s1codes.broma.metainfo.xml
       - cargo-sources.json

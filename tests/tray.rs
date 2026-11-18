@@ -1,22 +1,39 @@
 //! Tests for `src/tray/mod.rs` and `src/daemon_bus.rs`.
 
+use std::collections::HashSet;
+
 use crate::audio::DEVICE_DISABLED;
 use crate::audio::service::AudioServiceGuard;
 use crate::daemon_bus;
 use crate::tests::common::AUDIO_SERVER_TEST_LOCK;
-use crate::tray::{TrayController, default_icon_rgba};
+use crate::tray::{TrayController, decode_png_rgba, default_icon_rgba};
 
 #[test]
-fn placeholder_icon_is_valid_32x32_solid_blue_rgba() {
-    let (rgba, width, height) = default_icon_rgba();
-    assert_eq!(width, 32);
-    assert_eq!(height, 32);
-    assert_eq!(rgba.len(), 32 * 32 * 4);
+fn bundled_app_icon_decodes_valid_64x64_rgba_for_tray_and_window() {
+    let (rgba, width, height) = default_icon_rgba().expect("bundled 64x64.png should decode");
+    assert_eq!(width, 64);
+    assert_eq!(height, 64);
+    assert_eq!(rgba.len(), 64 * 64 * 4);
+
     let (pixels, remainder) = rgba.as_chunks::<4>();
     assert!(remainder.is_empty());
-    for pixel in pixels {
-        assert_eq!(pixel, &[0x3B, 0x82, 0xF6, 0xFF]);
-    }
+    assert_eq!(pixels[0], [0x00, 0x00, 0x12, 0xFF]);
+
+    let distinct_colors: HashSet<[u8; 4]> = pixels.iter().copied().collect();
+    assert!(
+        distinct_colors.len() > 1,
+        "bundled icon should contain artwork with multiple colors, not a solid block"
+    );
+
+    tray_icon::Icon::from_rgba(rgba.clone(), width, height)
+        .expect("tray_icon::Icon::from_rgba should accept decoded bundled icon");
+    iced::window::icon::from_rgba(rgba, width, height)
+        .expect("iced::window::icon::from_rgba should accept decoded bundled icon");
+}
+
+#[test]
+fn decode_png_rgba_rejects_corrupt_bytes() {
+    assert!(decode_png_rgba(b"invalid png").is_err());
 }
 
 #[test]

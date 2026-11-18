@@ -2,7 +2,7 @@
 // Licensed under the BSD 3-Clause License.
 // See LICENSE for details.
 
-//! System tray lifecycle, placeholder icon, context menu, and event routing.
+//! System tray lifecycle, bundled app icon, context menu, and event routing.
 //!
 //! Tied directly to the user's `close_to_tray` preference:
 //! - When enabled (default), registers the OS tray icon and binds its click and
@@ -31,16 +31,66 @@ struct TrayCallbackTarget {
 
 static TRAY_TARGET: OnceLock<Mutex<Option<TrayCallbackTarget>>> = OnceLock::new();
 
-/// Placeholder `32x32` solid blue (`#3B82F6`) icon.
-/// Swap this single function's bytes when adding custom app icon artwork later.
-pub fn default_icon_rgba() -> (Vec<u8>, u32, u32) {
-    const WIDTH: u32 = 32;
-    const HEIGHT: u32 = 32;
-    let mut rgba = Vec::with_capacity((WIDTH * HEIGHT * 4) as usize);
-    for _ in 0..(WIDTH * HEIGHT) {
-        rgba.extend_from_slice(&[0x3B, 0x82, 0xF6, 0xFF]);
+const APP_ICON_PNG: &[u8] = include_bytes!("../../assets/64x64.png");
+
+/// Decodes the bundled `64x64` Broma icon into 8-bit-per-channel RGBA pixels.
+///
+/// The same `64x64.png` asset is shared by both the OS tray icon and the
+/// window title-bar icon so they stay visually consistent across platforms.
+/// `STRIP_16` is enabled because `assets/64x64.png` is stored as 16-bit RGBA,
+/// whereas `tray_icon` and `iced::window::icon` require 8-bit RGBA (`u8`).
+pub fn default_icon_rgba() -> Result<(Vec<u8>, u32, u32), String> {
+    decode_png_rgba(APP_ICON_PNG)
+}
+
+pub(crate) fn decode_png_rgba(png_bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(png_bytes));
+    decoder.set_ignore_text_chunk(true);
+    decoder.set_transformations(png::Transformations::ALPHA | png::Transformations::STRIP_16);
+
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| format!("Failed to read PNG header: {e}"))?;
+
+    let buf_size = reader
+        .output_buffer_size()
+        .ok_or_else(|| "PNG output buffer size overflow".to_string())?;
+    let mut buf = vec![0u8; buf_size];
+    let info = reader
+        .next_frame(&mut buf)
+        .map_err(|e| format!("Failed to decode PNG frame: {e}"))?;
+    buf.truncate(info.buffer_size());
+
+    if info.bit_depth != png::BitDepth::Eight {
+        return Err(format!(
+            "Expected 8-bit PNG output after STRIP_16, got {:?}",
+            info.bit_depth
+        ));
     }
-    (rgba, WIDTH, HEIGHT)
+
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => buf,
+        png::ColorType::Rgb => buf
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .flat_map(|px| [px[0], px[1], px[2], 0xFF])
+            .collect(),
+        png::ColorType::GrayscaleAlpha => buf
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .flat_map(|px| [px[0], px[0], px[0], px[1]])
+            .collect(),
+        png::ColorType::Grayscale => buf.into_iter().flat_map(|g| [g, g, g, 0xFF]).collect(),
+        other => {
+            return Err(format!(
+                "Unsupported PNG color type for RGBA icon: {other:?}"
+            ));
+        }
+    };
+
+    Ok((rgba, info.width, info.height))
 }
 
 pub struct TrayController {
@@ -144,7 +194,7 @@ fn install_tray_handlers(audio: AudioHandle, bus: DaemonSender) {
 }
 
 fn build_tray_icon_and_menu() -> Result<(Icon, Menu), String> {
-    let (rgba, width, height) = default_icon_rgba();
+    let (rgba, width, height) = default_icon_rgba()?;
     let icon = Icon::from_rgba(rgba, width, height)
         .map_err(|e| format!("Failed to construct tray icon: {e}"))?;
 

@@ -379,6 +379,7 @@ dependencies = [
  "directories",
  "global-hotkey",
  "iced",
+ "png",
  "pulseaudio",
  "rfd",
  "rtrb",

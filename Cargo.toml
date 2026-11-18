@@ -12,6 +12,7 @@ blake3 = { version = "1.8.7", features = ["pure"] }
 cpal = { version = "0.18.2", features = ["pulseaudio"] }
 directories = "6.0.0"
 iced = { version = "0.14.0", default-features = false, features = ["tiny-skia", "thread-pool", "wayland", "crisp", "web-colors"] }
+png = { version = "0.18.1", default-features = false }
 rfd = "0.18.0"
 rtrb = "0.4.1"
 rubato = "5.1.0"
