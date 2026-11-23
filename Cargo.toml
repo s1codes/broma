@@ -33,3 +33,25 @@ lto = "thin"
 codegen-units = 1
 strip = "symbols"
 panic = "abort"
+
+[package.metadata.packager]
+productName = "Broma"
+identifier = "io.github.s1codes.broma"
+out-dir = "./dist"
+before-packaging-command = "cargo build --release"
+icons = ["assets/*"]
+binaries = [
+    { main = true, path = "broma"}
+]
+[package.metadata.packager.deb]
+depends = [
+    "libasound2",
+    "libgcc-s1",
+    "libc6"
+]
+[package.metadata.packager.pacman]
+depends = [
+    "libasound2",
+    "libgcc-s1",
+    "libc6"
+]
