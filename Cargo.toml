@@ -29,10 +29,10 @@ pulseaudio = "0.3"
 global-hotkey = "0.10.0"
 
 [profile.release]
-lto = "thin"
+strip = true
+opt-level = 'z'
+lto = true
 codegen-units = 1
-strip = "symbols"
-panic = "abort"
 
 [package.metadata.packager]
 productName = "Broma"
