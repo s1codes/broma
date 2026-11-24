@@ -77,6 +77,21 @@ impl RecoveryBackoff {
         self.next_retry_at.is_none_or(|retry_at| now >= retry_at)
     }
 
+    /// True once this route has had at least one reopen attempt since the last
+    /// reset. Distinguishes "device was lost" (worth retrying) from "device was
+    /// never present at boot" (leave it alone until an explicit refresh).
+    pub(crate) fn has_attempted(&self) -> bool {
+        self.consecutive_failures > 0
+    }
+
+    /// Whether a route should be reopened: a reported fault always qualifies,
+    /// while a *missing* endpoint only qualifies after a previous attempt
+    /// failed. Without that gate, sessions with no audio hardware at boot (CI,
+    /// headless servers, a PC whose mic is unplugged) would retry forever.
+    pub(crate) fn needs_reopen(&self, faulted: bool, missing: bool) -> bool {
+        faulted || (missing && self.has_attempted())
+    }
+
     /// Records an attempt and schedules the earliest time for the next one.
     pub(crate) fn record_attempt(&mut self, now: Instant) {
         let settled = self
@@ -446,11 +461,21 @@ impl AudioEngine {
         let cable_faulted = self.is_cable_faulted();
         let mic_faulted = self.is_mic_faulted();
 
-        let cable_needs = cable_faulted || (self.virtual_cable.is_none() && self.cable_wanted());
-        let monitor_needs = monitor_faulted || (self.monitor.is_none() && self.monitor_wanted());
+        // A route that never opened at boot is not retried here: it only becomes
+        // retry-worthy after a reopen actually failed, or on an explicit
+        // "Refresh Devices". This keeps headless/no-device sessions inert
+        // instead of burning backoff attempts on absent hardware.
+        let cable_needs = self.cable_backoff.needs_reopen(
+            cable_faulted,
+            self.virtual_cable.is_none() && self.cable_wanted(),
+        );
+        let monitor_needs = self.monitor_backoff.needs_reopen(
+            monitor_faulted,
+            self.monitor.is_none() && self.monitor_wanted(),
+        );
         // Fueling a mic bridge with no live cable endpoint is pointless.
-        let mic_needs =
-            mic_faulted || (self.mic_bridge.is_none() && self.mic_wanted() && !cable_needs);
+        let mic_missing = self.mic_bridge.is_none() && self.mic_wanted() && !cable_needs;
+        let mic_needs = self.mic_backoff.needs_reopen(mic_faulted, mic_missing);
 
         let attempt_cable = cable_needs && self.cable_backoff.can_attempt(now);
         let attempt_monitor = monitor_needs && self.monitor_backoff.can_attempt(now);
@@ -602,7 +627,24 @@ impl AudioEngine {
             self.reopen_monitor_only();
         }
 
+        self.arm_retries_for_still_missing_routes();
         self.publish_device_error();
+    }
+
+    /// A refresh that failed leaves the route missing with no fault flag, so
+    /// background recovery would never run. Record a failed attempt to keep the
+    /// retry loop armed for when the device later becomes available.
+    fn arm_retries_for_still_missing_routes(&mut self) {
+        let now = Instant::now();
+        if self.virtual_cable.is_none() && self.cable_wanted() {
+            self.cable_backoff.record_attempt(now);
+        }
+        if self.mic_bridge.is_none() && self.mic_wanted() && self.virtual_cable.is_some() {
+            self.mic_backoff.record_attempt(now);
+        }
+        if self.monitor.is_none() && self.monitor_wanted() {
+            self.monitor_backoff.record_attempt(now);
+        }
     }
 
     pub fn invalidate_cached_file(&mut self, path: &Path) {

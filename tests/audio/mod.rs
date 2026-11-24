@@ -158,6 +158,43 @@ fn recovery_backoff_progresses_from_immediate_to_capped_delays() {
 }
 
 #[test]
+fn recovery_backoff_reports_whether_recovery_has_been_attempted() {
+    let t0 = Instant::now();
+    let mut backoff = RecoveryBackoff::new();
+    assert!(
+        !backoff.has_attempted(),
+        "a route that never opened must not be retried at boot"
+    );
+
+    // The CI regression: an absent device at boot must not look "recoverable".
+    assert!(
+        !backoff.needs_reopen(false, true),
+        "a never-opened endpoint must stay inert until an explicit refresh"
+    );
+    assert!(
+        backoff.needs_reopen(true, false),
+        "a faulted stream always needs a reopen"
+    );
+
+    backoff.record_attempt(t0);
+    assert!(
+        backoff.has_attempted(),
+        "a failed reopen must keep the route retry-armed"
+    );
+    assert!(
+        backoff.needs_reopen(false, true),
+        "an endpoint lost after a failed reopen must be retried"
+    );
+
+    backoff.reset();
+    assert!(
+        !backoff.has_attempted(),
+        "reset clears retry-armed state for a fresh device selection"
+    );
+    assert!(!backoff.needs_reopen(false, true));
+}
+
+#[test]
 fn recovery_backoff_forgets_failures_after_settle_window() {
     let t0 = Instant::now();
     let mut backoff = RecoveryBackoff::new();
