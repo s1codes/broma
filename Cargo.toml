@@ -3,6 +3,7 @@ name = "broma"
 version = "1.0.1"
 edition = "2024"
 authors = ["Sayantan Banerjee"]
+repository = "https://github.com/s1codes/broma"
 description = "Guilt free and efficient Soundboard"
 autotests = false
 license = "BSD-3-Clause"
@@ -55,3 +56,16 @@ depends = [
     "libgcc-s1",
     "libc6"
 ]
+[package.metadata.packager.linux]
+generateDesktopEntry = true
+
+[package.metadata.generate-rpm]
+assets = [
+  { source = "target/release/broma", dest = "/usr/bin/broma", mode = "755" },
+  { source = "dist/.cargo-packager/appimage/broma.AppDir/broma.desktop", dest = "/usr/share/applications/myapp.desktop", mode = "644" },
+  { source = "assets/256x256.png", dest = "/usr/share/icons/hicolor/256x256/apps/myapp.png", mode = "644" },
+]
+[package.metadata.generate-rpm.requires]
+alsa-lib = "*"
+libgcc = "*"
+glibc = "*"

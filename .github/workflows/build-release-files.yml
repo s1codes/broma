@@ -65,10 +65,16 @@ jobs:
       - name: Install cargo-packager
         uses: baptiste0928/cargo-install@v3.5.0
         with:
-          crate: cargo-packager
+          crate: |
+              cargo-packager
+              cargo-generate-rpm
 
       - name: Build & Package final binary
         run: cargo packager --release --formats ${{ matrix.formats }}
+
+      - name: Build RPM Package
+        if: runner.os == 'Linux'
+        run: cargo generate-rpm -o dist/
 
       - name: Upload a Build Artifact
         uses: actions/upload-artifact@v7.0.2
