@@ -25,6 +25,8 @@ pub enum DaemonEvent {
     TrayQuit,
     AudioPlaybackChanged,
     AudioError(String),
+    /// Routing recovered cleanly; clear any stale audio error shown in the UI.
+    AudioStatusCleared,
     HotkeyError(String),
     DevicesRefreshed {
         microphones: Vec<String>,

@@ -5,8 +5,8 @@ use std::{fs, io};
 use crate::storage::{
     AppConfig, DEFAULT_STREAM_VOLUME, MAX_GRID_ROWS, MAX_SLOTS, MIN_PITCH_PERCENT, SlotConfig,
     compute_library_stats_in_dir, delete_all_data_in_dir, export_backup_from_dir, format_bytes,
-    import_audio_into_dir, import_backup_into_dir, remove_sound_if_unreferenced_in_dir,
-    rename_with_transient_retry, save_config_in_dir,
+    import_audio_into_dir, import_backup_into_dir, import_backup_into_dir_with_limit,
+    remove_sound_if_unreferenced_in_dir, rename_with_transient_retry, save_config_in_dir,
 };
 use crate::tests::common::build_test_wav;
 
@@ -253,6 +253,28 @@ fn backup_export_delete_and_import_round_trips_library_and_stats() {
     let stats_after = compute_library_stats_in_dir(&data_dir);
     assert_eq!(stats_after.sound_files, 1);
     assert!(stats_after.total_bytes > wav_bytes.len() as u64);
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+#[test]
+fn backup_import_rejects_oversized_archives_before_reading_them() {
+    let root = std::env::temp_dir().join("broma_test_backup_oversized");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(&root).unwrap();
+
+    let restore_dir = root.join("restore");
+    let archive = root.join("huge.bromapack");
+    fs::write(&archive, b"BROMAPK1-and-some-padding").unwrap();
+
+    // A tiny explicit cap stands in for the 512 MB production limit.
+    let err = import_backup_into_dir_with_limit(&restore_dir, &archive, 4)
+        .expect_err("oversized archive must be rejected before allocation");
+    assert!(err.contains("too large"), "got: {err}");
+    assert!(
+        !restore_dir.exists(),
+        "no partial restore directory may be created"
+    );
 
     let _ = fs::remove_dir_all(&root);
 }

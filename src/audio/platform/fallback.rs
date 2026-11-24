@@ -7,7 +7,7 @@
 use cpal::traits::HostTrait;
 use cpal::{Device, Host};
 
-use crate::audio::mic_bridge::MicBridge;
+use crate::audio::mic_bridge::{MicBridge, MicPassthroughConsumer};
 use crate::audio::platform::ActiveVirtualRoute;
 use crate::audio::{DEVICE_DISABLED, DEVICE_SYSTEM_DEFAULT_MIC, device_display_name};
 
@@ -73,17 +73,41 @@ impl FallbackAudioRouter {
             .find(|d| device_display_name(d) == output_selection)
             .ok_or_else(|| format!("Output device '{output_selection}' not available"))?;
 
-        let mic_bridge = if mic_selection.is_empty() || mic_selection == DEVICE_DISABLED {
-            None
-        } else {
-            resolve_input(host, mic_selection).and_then(|dev| MicBridge::open(dev).ok())
-        };
+        let (mic_bridge, route_warning) = self.open_mic_bridge(host, mic_selection);
 
         Ok(Some(ActiveVirtualRoute {
             sink_device,
             mic_bridge,
-            route_warning: None,
+            route_warning,
         }))
+    }
+
+    /// Opens the in-process microphone capture bridge for `mic_selection`.
+    pub fn open_mic_bridge(
+        &self,
+        host: &Host,
+        mic_selection: &str,
+    ) -> (Option<(MicBridge, MicPassthroughConsumer)>, Option<String>) {
+        if mic_selection.is_empty() || mic_selection == DEVICE_DISABLED {
+            return (None, None);
+        }
+
+        let Some(mic_dev) = resolve_input(host, mic_selection) else {
+            return (
+                None,
+                Some(format!(
+                    "Microphone '{mic_selection}' not found — soundboard active without mic passthrough"
+                )),
+            );
+        };
+
+        match MicBridge::open(mic_dev) {
+            Ok(bridge) => (Some(bridge), None),
+            Err(err) => (
+                None,
+                Some(format!("Microphone passthrough unavailable: {err}")),
+            ),
+        }
     }
 }
 

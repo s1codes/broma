@@ -20,10 +20,10 @@
 //!   Windows Microphone Privacy settings, keeps soundboard playback alive on
 //!   the virtual cable and reports an explicit `route_warning`.
 
-use cpal::traits::HostTrait;
+use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{Device, Host};
 
-use crate::audio::mic_bridge::MicBridge;
+use crate::audio::mic_bridge::{MicBridge, MicPassthroughConsumer};
 use crate::audio::platform::ActiveVirtualRoute;
 use crate::audio::{DEVICE_DISABLED, DEVICE_SYSTEM_DEFAULT_MIC, device_display_name};
 
@@ -83,35 +83,108 @@ impl WindowsAudioRouter {
             format!("Windows output device '{output_selection}' is not available")
         })?;
 
-        let (mic_bridge, route_warning) = if mic_selection.is_empty()
-            || mic_selection == DEVICE_DISABLED
-        {
-            (None, None)
-        } else {
-            match find_windows_input_device(host, mic_selection) {
-                Some(mic_dev) => match MicBridge::open(mic_dev) {
-                    Ok(bridge) => (Some(bridge), None),
-                    Err(err) => (
-                        None,
-                        Some(format!(
-                            "Microphone passthrough unavailable ({err}) — check Windows Microphone Privacy settings"
-                        )),
-                    ),
-                },
-                None => (
-                    None,
-                    Some(format!(
-                        "Microphone '{mic_selection}' not found — soundboard active without mic passthrough"
-                    )),
-                ),
-            }
-        };
+        let (mic_bridge, route_warning) = self.open_mic_bridge(host, mic_selection);
 
         Ok(Some(ActiveVirtualRoute {
             sink_device,
             mic_bridge,
             route_warning,
         }))
+    }
+
+    /// Opens the hardware microphone capture bridge for `mic_selection`.
+    ///
+    /// Shared by initial routing and by isolated mic recovery, so a failed
+    /// attempt always reports the same explicit warning instead of silence.
+    pub fn open_mic_bridge(
+        &self,
+        host: &Host,
+        mic_selection: &str,
+    ) -> (Option<(MicBridge, MicPassthroughConsumer)>, Option<String>) {
+        if mic_selection.is_empty() || mic_selection == DEVICE_DISABLED {
+            return (None, None);
+        }
+
+        match find_windows_input_device(host, mic_selection) {
+            Some(mic_dev) => match MicBridge::open(mic_dev) {
+                Ok(bridge) => (Some(bridge), None),
+                Err(err) => (
+                    None,
+                    Some(format!(
+                        "Microphone passthrough unavailable ({err}) — check Windows Microphone Privacy settings"
+                    )),
+                ),
+            },
+            None => (
+                None,
+                Some(format!(
+                    "Microphone '{mic_selection}' not found — soundboard active without mic passthrough"
+                )),
+            ),
+        }
+    }
+}
+
+/// Returns the index of the enumerated endpoint representing the OS default device.
+///
+/// Matching prefers the backend `DeviceId` (e.g. `"wasapi:{0.0.1.00000000}.{...}"`)
+/// and falls back to the display name. Pure so it is unit-testable off Windows.
+pub(crate) fn matching_index<'a, I>(
+    default_id: Option<&str>,
+    default_name: &str,
+    candidates: I,
+) -> Option<usize>
+where
+    I: IntoIterator<Item = (Option<&'a str>, &'a str)>,
+{
+    let candidates: Vec<(Option<&str>, &str)> = candidates.into_iter().collect();
+
+    if let Some(id) = default_id
+        && let Some(idx) = candidates.iter().position(|(cid, _)| *cid == Some(id))
+    {
+        return Some(idx);
+    }
+
+    if !default_name.is_empty() {
+        return candidates
+            .iter()
+            .position(|(_, name)| *name == default_name);
+    }
+
+    None
+}
+
+/// Re-resolves the OS default `Device` handle to its concrete enumerated peer.
+///
+/// `cpal 0.18.2` WASAPI (#1402) can hand back a default endpoint whose COM
+/// context is poisoned after stream churn; reopening the matching enumerated
+/// handle avoids reusing that default endpoint directly. Falls back to
+/// `default_dev` when enumeration fails or no peer matches.
+pub(crate) fn resolve_specific_device(
+    default_dev: Device,
+    enumerated: Option<impl Iterator<Item = Device>>,
+) -> Device {
+    let Some(devices) = enumerated else {
+        return default_dev;
+    };
+    let devices: Vec<Device> = devices.collect();
+
+    let default_id = default_dev.id().ok().map(|id| id.to_string());
+    let default_name = device_display_name(&default_dev);
+
+    let ids: Vec<Option<String>> = devices
+        .iter()
+        .map(|dev| dev.id().ok().map(|id| id.to_string()))
+        .collect();
+    let names: Vec<String> = devices.iter().map(device_display_name).collect();
+    let entries = ids
+        .iter()
+        .map(Option::as_deref)
+        .zip(names.iter().map(String::as_str));
+
+    match matching_index(default_id.as_deref(), &default_name, entries) {
+        Some(idx) => devices.into_iter().nth(idx).unwrap_or(default_dev),
+        None => default_dev,
     }
 }
 
@@ -193,6 +266,8 @@ fn find_windows_output_device(host: &Host, selection: &str) -> Option<Device> {
 fn find_windows_input_device(host: &Host, selection: &str) -> Option<Device> {
     if selection == DEVICE_SYSTEM_DEFAULT_MIC {
         if let Some(default_mic) = host.default_input_device() {
+            // Prefer the concrete enumerated handle (#1402) when one matches.
+            let default_mic = resolve_specific_device(default_mic, host.input_devices().ok());
             let name = device_display_name(&default_mic);
             if !is_windows_loopback_input(&name) {
                 return Some(default_mic);

@@ -139,6 +139,128 @@ fn mic_passthrough_is_bit_exact_when_idle_and_sums_when_playing() {
 }
 
 #[test]
+fn replace_mic_hot_swaps_passthrough_while_voices_keep_playing() {
+    let (mut cmd_tx, cmd_rx) = RingBuffer::new(32);
+    let (retired_tx, _retired_rx) = RingBuffer::new(32);
+    let (retired_mic_tx, mut retired_mic_rx) = RingBuffer::new(8);
+    let status = Arc::new(StreamStatus::default());
+    let (old_mic_tx, old_mic_rx) = RingBuffer::new(64);
+
+    let mut mixer = Mixer::new(
+        2,
+        48_000,
+        1.0,
+        cmd_rx,
+        retired_tx,
+        Arc::clone(&status),
+        Some(MicPassthroughConsumer {
+            rx: old_mic_rx,
+            sample_rate: 48_000,
+        }),
+    )
+    .with_retired_mic(retired_mic_tx);
+
+    // Long soundboard voice (64 mono frames) so it cannot finish during the swap.
+    cmd_tx
+        .push(MixerCommand::Play {
+            tag: VoiceTag::Slot(0),
+            samples: Arc::from(vec![16_384i16; 64]),
+            clip_channels: 1,
+            clip_sample_rate: 48_000,
+            base_gain: 1.0,
+            pitch: 1.0,
+            follows_global_volume: false,
+        })
+        .unwrap();
+
+    let mut first = vec![0.0f32; 4];
+    mixer.render_f32(&mut first);
+    assert_eq!(status.active_slots_mask.load(Ordering::Relaxed), 1);
+    assert!(retired_mic_rx.is_empty());
+
+    // Hot-swap to a fresh mic ring while the voice plays.
+    let (mut new_mic_tx, new_mic_rx) = RingBuffer::new(64);
+    cmd_tx
+        .push(MixerCommand::ReplaceMic(Some(MicPassthroughConsumer {
+            rx: new_mic_rx,
+            sample_rate: 48_000,
+        })))
+        .unwrap();
+    for _ in 0..8 {
+        new_mic_tx.push(0.125f32).unwrap();
+    }
+
+    let mut out = vec![0.0f32; 4];
+    mixer.render_f32(&mut out);
+
+    // Voice still playing and the new mic ring is the one being mixed.
+    assert_eq!(status.active_slots_mask.load(Ordering::Relaxed), 1);
+    assert!((out[0] - 0.625).abs() < 0.01, "got {}", out[0]);
+    assert!((out[1] - 0.625).abs() < 0.01, "got {}", out[1]);
+
+    // Old ring is retired to the UI thread instead of being dropped in the callback.
+    let retired = retired_mic_rx
+        .pop()
+        .expect("replaced mic ring must be retired");
+    drop(retired);
+    assert!(old_mic_tx.is_abandoned());
+}
+
+#[test]
+fn replace_mic_none_stops_passthrough_but_keeps_voices_playing() {
+    let (mut cmd_tx, cmd_rx) = RingBuffer::new(32);
+    let (retired_tx, _retired_rx) = RingBuffer::new(32);
+    let (retired_mic_tx, mut retired_mic_rx) = RingBuffer::new(8);
+    let status = Arc::new(StreamStatus::default());
+    let (mut mic_tx, mic_rx) = RingBuffer::new(64);
+
+    let mut mixer = Mixer::new(
+        2,
+        48_000,
+        1.0,
+        cmd_rx,
+        retired_tx,
+        Arc::clone(&status),
+        Some(MicPassthroughConsumer {
+            rx: mic_rx,
+            sample_rate: 48_000,
+        }),
+    )
+    .with_retired_mic(retired_mic_tx);
+
+    cmd_tx
+        .push(MixerCommand::Play {
+            tag: VoiceTag::Slot(1),
+            samples: Arc::from(vec![16_384i16; 64]),
+            clip_channels: 1,
+            clip_sample_rate: 48_000,
+            base_gain: 1.0,
+            pitch: 1.0,
+            follows_global_volume: false,
+        })
+        .unwrap();
+    cmd_tx.push(MixerCommand::ReplaceMic(None)).unwrap();
+
+    for _ in 0..8 {
+        mic_tx.push(0.5f32).unwrap();
+    }
+
+    let mut out = vec![0.0f32; 4];
+    mixer.render_f32(&mut out);
+
+    // Mic passthrough is gone; only the soundboard voice remains.
+    assert!((out[0] - 0.5).abs() < 0.001, "got {}", out[0]);
+    assert!((out[1] - 0.5).abs() < 0.001, "got {}", out[1]);
+    assert_eq!(status.active_slots_mask.load(Ordering::Relaxed), 1u64 << 1);
+
+    let retired = retired_mic_rx
+        .pop()
+        .expect("disabled mic ring must be retired");
+    drop(retired);
+    assert!(mic_tx.is_abandoned());
+}
+
+#[test]
 fn renders_7_1_surround_8ch_wasapi_mix_format_cleanly() {
     let (mut cmd_tx, cmd_rx) = RingBuffer::new(16);
     let (retired_tx, _retired_rx) = RingBuffer::new(16);

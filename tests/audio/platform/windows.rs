@@ -2,7 +2,7 @@
 
 use crate::audio::platform::windows::{
     WindowsAudioRouter, filter_windows_microphones, is_windows_loopback_input,
-    is_windows_virtual_cable_output, sort_and_dedupe_windows_outputs,
+    is_windows_virtual_cable_output, matching_index, sort_and_dedupe_windows_outputs,
 };
 use crate::audio::{DEVICE_DISABLED, DEVICE_SYSTEM_DEFAULT_MIC};
 
@@ -92,6 +92,41 @@ fn missing_windows_output_returns_explicit_error_not_silent_noop() {
         Ok(_) => panic!("missing Windows output endpoint must return Err, not succeed silently"),
         Err(msg) => assert!(msg.contains("Nonexistent_WASAPI_Cable_Endpoint_12345")),
     }
+}
+
+#[test]
+fn resolves_os_default_endpoint_to_concrete_enumerated_handle() {
+    let candidates = [
+        (Some("wasapi:{0.0.0.00000000}.{aaa}"), "Speakers (Realtek)"),
+        (Some("wasapi:{0.0.1.00000000}.{bbb}"), "Headphones (USB)"),
+        (None, "CABLE Input (VB-Audio Virtual Cable)"),
+    ];
+
+    // DeviceId match wins even when the display name differs.
+    assert_eq!(
+        matching_index(
+            Some("wasapi:{0.0.1.00000000}.{bbb}"),
+            "Speakers (Realtek)",
+            candidates,
+        ),
+        Some(1)
+    );
+
+    // Falls back to display-name matching when the backend id is unavailable.
+    assert_eq!(
+        matching_index(None, "CABLE Input (VB-Audio Virtual Cable)", candidates),
+        Some(2)
+    );
+
+    // Unknown default endpoint falls through so the caller keeps the original handle.
+    assert_eq!(
+        matching_index(
+            Some("wasapi:{0.0.9.00000000}.{zzz}"),
+            "Ghost Device",
+            candidates
+        ),
+        None
+    );
 }
 
 #[cfg(target_os = "windows")]

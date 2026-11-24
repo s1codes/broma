@@ -28,7 +28,7 @@ use pulseaudio::protocol::{
     ModuleInfoList, Prop, Props, ServerInfo, SetClientNameReply, SourceInfo,
 };
 
-use crate::audio::mic_bridge::MicBridge;
+use crate::audio::mic_bridge::{MicBridge, MicPassthroughConsumer};
 use crate::audio::platform::ActiveVirtualRoute;
 use crate::audio::{DEVICE_DISABLED, DEVICE_SYSTEM_DEFAULT_MIC, device_display_name};
 
@@ -162,32 +162,44 @@ impl LinuxAudioRouter {
         let sink_device = find_linux_output_device(host, output_selection)
             .ok_or_else(|| format!("Linux output sink '{output_selection}' is not available"))?;
 
-        let (mic_bridge, route_warning) = if mic_selection.is_empty()
-            || mic_selection == DEVICE_DISABLED
-        {
-            (None, None)
-        } else if let Some(mic_dev) = find_linux_input_device(host, mic_selection) {
-            match MicBridge::open(mic_dev) {
-                Ok(bridge) => (Some(bridge), None),
-                Err(err) => (
-                    None,
-                    Some(format!("Microphone passthrough unavailable: {err}")),
-                ),
-            }
-        } else {
-            (
-                None,
-                Some(format!(
-                    "Microphone '{mic_selection}' not found — soundboard active without mic passthrough"
-                )),
-            )
-        };
+        let (mic_bridge, route_warning) = self.open_mic_bridge(host, mic_selection);
 
         Ok(Some(ActiveVirtualRoute {
             sink_device,
             mic_bridge,
             route_warning,
         }))
+    }
+
+    /// Opens in-process `cpal` mic capture for non-managed (external) sinks.
+    ///
+    /// The managed `"Broma Virtual Mic (Auto)"` route keeps using
+    /// `module-loopback` inside PipeWire/PulseAudio and returns `None`.
+    pub fn open_mic_bridge(
+        &self,
+        host: &Host,
+        mic_selection: &str,
+    ) -> (Option<(MicBridge, MicPassthroughConsumer)>, Option<String>) {
+        if mic_selection.is_empty() || mic_selection == DEVICE_DISABLED {
+            return (None, None);
+        }
+
+        let Some(mic_dev) = find_linux_input_device(host, mic_selection) else {
+            return (
+                None,
+                Some(format!(
+                    "Microphone '{mic_selection}' not found — soundboard active without mic passthrough"
+                )),
+            );
+        };
+
+        match MicBridge::open(mic_dev) {
+            Ok(bridge) => (Some(bridge), None),
+            Err(err) => (
+                None,
+                Some(format!("Microphone passthrough unavailable: {err}")),
+            ),
+        }
     }
 
     pub fn teardown(&mut self) {

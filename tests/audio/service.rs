@@ -57,6 +57,67 @@ fn background_audio_service_spawns_handles_commands_and_joins_cleanly() {
     assert!(matches!(first_event, Some(DaemonEvent::AudioError(_))));
 }
 
+#[test]
+fn refresh_devices_reports_errors_and_refreshed_lists_when_window_open() {
+    let _guard = AUDIO_SERVER_TEST_LOCK.lock().unwrap();
+    let (bus_tx, bus_rx) = daemon_bus::create();
+
+    let mut boot = AudioServiceGuard::spawn(
+        Some(DEVICE_DISABLED),
+        Some(DEVICE_DISABLED),
+        Some(DEVICE_DISABLED),
+        0,
+        100,
+        100,
+        true,
+        bus_tx,
+    );
+
+    let handle = boot.guard.handle();
+
+    // Selecting a nonexistent virtual cable must surface an explicit AudioError.
+    handle.set_virtual_output("Nonexistent_Cable_Endpoint_XYZ");
+    std::thread::sleep(Duration::from_millis(25));
+
+    // Refreshing must still report the (now recovered-or-failed) device lists.
+    handle.refresh_devices();
+    std::thread::sleep(Duration::from_millis(25));
+
+    boot.guard.shutdown();
+
+    let mut raw_rx = bus_rx_take_for_test(&bus_rx);
+    let mut saw_audio_error = false;
+    let mut saw_devices_refreshed = false;
+    for _ in 0..32 {
+        let Some(evt) = block_on(async { raw_rx.next().await }) else {
+            break;
+        };
+        match evt {
+            DaemonEvent::AudioError(msg) => {
+                assert!(
+                    msg.contains("Nonexistent_Cable_Endpoint_XYZ"),
+                    "unexpected error text: {msg}"
+                );
+                saw_audio_error = true;
+            }
+            DaemonEvent::DevicesRefreshed { .. } => saw_devices_refreshed = true,
+            _ => {}
+        }
+        if saw_audio_error && saw_devices_refreshed {
+            break;
+        }
+    }
+
+    assert!(
+        saw_audio_error,
+        "missing virtual cable must surface AudioError"
+    );
+    assert!(
+        saw_devices_refreshed,
+        "RefreshDevices must emit DevicesRefreshed"
+    );
+}
+
 fn bus_rx_take_for_test(
     bus_rx: &daemon_bus::DaemonReceiver,
 ) -> iced::futures::channel::mpsc::UnboundedReceiver<DaemonEvent> {

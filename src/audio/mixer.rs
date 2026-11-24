@@ -14,7 +14,7 @@
 //!   untouched at unity gain while idle and sums soundboard voices only when active.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use rtrb::{Consumer, Producer};
 
@@ -31,7 +31,9 @@ pub enum VoiceTag {
 }
 
 /// Commands sent from the UI thread to a stream mixer over an `rtrb` ring buffer.
-#[derive(Debug, Clone)]
+///
+/// `Clone` is intentionally not derived: [`MixerCommand::ReplaceMic`] carries a
+/// non-cloneable ring-buffer consumer, so call sites build one command per stream.
 pub enum MixerCommand {
     Play {
         tag: VoiceTag,
@@ -51,6 +53,40 @@ pub enum MixerCommand {
         gain: f32,
         pitch: f32,
     },
+    /// Hot-swaps the microphone passthrough consumer (isolated mic recovery).
+    /// Active soundboard voices are never touched.
+    ReplaceMic(Option<MicPassthroughConsumer>),
+}
+
+impl std::fmt::Debug for MixerCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Play {
+                tag,
+                clip_channels,
+                clip_sample_rate,
+                ..
+            } => f
+                .debug_struct("Play")
+                .field("tag", tag)
+                .field("clip_channels", clip_channels)
+                .field("clip_sample_rate", clip_sample_rate)
+                .finish_non_exhaustive(),
+            Self::StopTag(tag) => f.debug_tuple("StopTag").field(tag).finish(),
+            Self::StopAll => f.write_str("StopAll"),
+            Self::SetGlobalVolume(vol) => f.debug_tuple("SetGlobalVolume").field(vol).finish(),
+            Self::SetStreamVolume(vol) => f.debug_tuple("SetStreamVolume").field(vol).finish(),
+            Self::UpdatePreview { gain, pitch } => f
+                .debug_struct("UpdatePreview")
+                .field("gain", gain)
+                .field("pitch", pitch)
+                .finish(),
+            Self::ReplaceMic(mic) => f
+                .debug_tuple("ReplaceMic")
+                .field(&mic.as_ref().map_or("None", |_| "Some(<mic>)"))
+                .finish(),
+        }
+    }
 }
 
 /// Lock-free atomic playback state readable from the UI thread without locking.
@@ -62,6 +98,8 @@ pub struct StreamStatus {
     /// Flipped by `cpal`'s stream error callback (e.g. WASAPI `AUDCLNT_E_DEVICE_INVALIDATED`
     /// when a Windows USB headset is unplugged or default endpoint changes).
     pub stream_faulted: AtomicBool,
+    /// Encoded `cpal::ErrorKind` recorded lock-free by the stream error callback (`0` = none).
+    pub last_error_code: AtomicU8,
 }
 
 impl StreamStatus {
@@ -69,6 +107,7 @@ impl StreamStatus {
         self.active_slots_mask.store(0, Ordering::Relaxed);
         self.preview_playing.store(false, Ordering::Relaxed);
         self.stream_faulted.store(false, Ordering::Relaxed);
+        self.last_error_code.store(0, Ordering::Relaxed);
     }
 }
 
@@ -175,6 +214,11 @@ pub struct Mixer {
     stream_volume: f32,
     cmd_rx: Consumer<MixerCommand>,
     retired_tx: Producer<Arc<[i16]>>,
+    /// Retires replaced mic ring buffers to the UI thread so the audio callback
+    /// never deallocates a `Consumer<f32>` ring allocation (`AGENTS.md` §5).
+    retired_mic_tx: Option<Producer<Consumer<f32>>>,
+    /// Holds one mic consumer when `retired_mic_tx` is momentarily full.
+    parked_retired_mic: Option<Consumer<f32>>,
     status: Arc<StreamStatus>,
 }
 
@@ -198,8 +242,16 @@ impl Mixer {
             stream_volume: 1.0,
             cmd_rx,
             retired_tx,
+            retired_mic_tx: None,
+            parked_retired_mic: None,
             status,
         }
+    }
+
+    /// Wires the off-thread retirement queue for replaced mic consumers.
+    pub fn with_retired_mic(mut self, retired_mic_tx: Producer<Consumer<f32>>) -> Self {
+        self.retired_mic_tx = Some(retired_mic_tx);
+        self
     }
 
     pub fn render_f32(&mut self, out: &mut [f32]) {
@@ -324,6 +376,8 @@ impl Mixer {
     }
 
     fn drain_commands(&mut self) {
+        self.flush_parked_retired_mic();
+
         while let Ok(cmd) = self.cmd_rx.pop() {
             match cmd {
                 MixerCommand::Play {
@@ -384,7 +438,38 @@ impl Mixer {
                         }
                     }
                 }
+                MixerCommand::ReplaceMic(next_mic) => {
+                    if let Some(old) = self.mic_rx.take() {
+                        self.retire_mic(old.rx);
+                    }
+                    self.mic_rx = next_mic
+                        .map(|consumer| MicReceiver::new(consumer, self.stream_sample_rate));
+                }
             }
+        }
+    }
+
+    #[inline]
+    fn retire_mic(&mut self, rx: Consumer<f32>) {
+        let Some(tx) = &mut self.retired_mic_tx else {
+            // No retirement queue configured (unit tests only): drop here.
+            return;
+        };
+        if let Err(rtrb::PushError::Full(rx)) = tx.push(rx) {
+            self.parked_retired_mic = Some(rx);
+        }
+    }
+
+    #[inline]
+    fn flush_parked_retired_mic(&mut self) {
+        let Some(parked) = self.parked_retired_mic.take() else {
+            return;
+        };
+        let Some(tx) = &mut self.retired_mic_tx else {
+            return;
+        };
+        if let Err(rtrb::PushError::Full(parked)) = tx.push(parked) {
+            self.parked_retired_mic = Some(parked);
         }
     }
 

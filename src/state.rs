@@ -238,6 +238,7 @@ pub struct App {
     main_window: Option<window::Id>,
     last_window_opened_at: Option<Instant>,
     last_hotkey_error: Option<String>,
+    last_audio_error: Option<String>,
 
     pub microphones: Vec<String>,
     pub outputs: Vec<String>,
@@ -288,6 +289,7 @@ impl App {
             main_window: Some(win_id),
             last_window_opened_at: Some(Instant::now()),
             last_hotkey_error: None,
+            last_audio_error: audio_boot.initial_audio_error,
             microphones: audio_boot.microphones,
             outputs: audio_boot.virtual_outputs,
             monitor_outputs: audio_boot.monitor_outputs,
@@ -375,12 +377,24 @@ impl App {
                     }
                 }
                 DaemonEvent::AudioError(err) => {
+                    self.last_audio_error = Some(err.clone());
                     if let Some(modal) = &mut self.modal {
                         modal.error_hint = Some(err);
                         modal.refresh_labels(self.config.global_volume, self.audio.is_previewing());
                     } else if let Some(settings) = &mut self.settings_modal {
                         settings.status_message = Some(err);
                         settings.status_is_error = true;
+                        settings
+                            .refresh_labels(self.config.monitor_volume, self.config.cable_volume);
+                    }
+                }
+                DaemonEvent::AudioStatusCleared => {
+                    self.last_audio_error = None;
+                    if let Some(settings) = &mut self.settings_modal
+                        && settings.status_is_error
+                    {
+                        settings.status_message = None;
+                        settings.status_is_error = false;
                         settings
                             .refresh_labels(self.config.monitor_volume, self.config.cable_volume);
                     }
@@ -697,10 +711,14 @@ impl App {
                 self.audio.stop_preview();
                 self.hotkeys.set_suspended(false);
                 self.modal = None;
-                self.settings_modal = Some(SettingsModalState::new(
-                    self.config.monitor_volume,
-                    self.config.cable_volume,
-                ));
+                let mut settings =
+                    SettingsModalState::new(self.config.monitor_volume, self.config.cable_volume);
+                if let Some(err) = &self.last_audio_error {
+                    settings.status_message = Some(err.clone());
+                    settings.status_is_error = true;
+                    settings.refresh_labels(self.config.monitor_volume, self.config.cable_volume);
+                }
+                self.settings_modal = Some(settings);
             }
             Message::SettingsBackdropClicked => {
                 if let Some(settings) = &self.settings_modal

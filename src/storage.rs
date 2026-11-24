@@ -30,6 +30,10 @@ pub const MAX_PITCH_PERCENT: u16 = 200; // 2.00x
 
 const BACKUP_MAGIC: &[u8; 8] = b"BROMAPK1";
 
+/// Upper bound on an imported `.bromapack` archive (512 MB) so a corrupt or
+/// malicious file can never trigger an unbounded `fs::read` allocation.
+pub const MAX_BACKUP_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
+
 /// Result of importing and validating an external sound file (`AGENTS.md` §8).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportedSound {
@@ -500,6 +504,25 @@ pub fn import_backup(src_file: &Path) -> Result<AppConfig, String> {
 }
 
 pub fn import_backup_into_dir(base: &Path, src_file: &Path) -> Result<AppConfig, String> {
+    import_backup_into_dir_with_limit(base, src_file, MAX_BACKUP_ARCHIVE_BYTES)
+}
+
+/// Same as [`import_backup_into_dir`] but with an explicit archive size cap so
+/// the limit can be exercised without writing a multi-hundred-MB fixture.
+pub(crate) fn import_backup_into_dir_with_limit(
+    base: &Path,
+    src_file: &Path,
+    max_bytes: u64,
+) -> Result<AppConfig, String> {
+    let size = fs::metadata(src_file)
+        .map_err(|e| format!("Failed to read backup file: {e}"))?
+        .len();
+    if size > max_bytes {
+        return Err(format!(
+            "Backup file is too large ({size} bytes; the limit is {max_bytes} bytes)"
+        ));
+    }
+
     let bytes = fs::read(src_file).map_err(|e| format!("Failed to read backup file: {e}"))?;
     let mut cursor = 0usize;
 

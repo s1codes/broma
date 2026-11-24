@@ -91,6 +91,9 @@ pub struct AudioServiceBootstrap {
     pub selected_microphone: String,
     pub selected_virtual_output: String,
     pub selected_monitor: String,
+    /// Startup routing failure (e.g. Virtual Cable missing) surfaced in Settings
+    /// without emitting a bus event while the window is closed to tray.
+    pub initial_audio_error: Option<String>,
 }
 
 impl AudioServiceGuard {
@@ -121,7 +124,7 @@ impl AudioServiceGuard {
         let join_handle = thread::Builder::new()
             .name("broma-audio-service".to_string())
             .spawn(move || {
-                let boot = AudioEngine::bootstrap(
+                let mut boot = AudioEngine::bootstrap(
                     saved_mic.as_deref(),
                     saved_out.as_deref(),
                     saved_mon.as_deref(),
@@ -129,6 +132,7 @@ impl AudioServiceGuard {
                     monitor_volume,
                     cable_volume,
                 );
+                let initial_audio_error = boot.engine.take_pending_device_error();
                 let _ = init_tx.send((
                     boot.microphones,
                     boot.virtual_outputs,
@@ -136,6 +140,7 @@ impl AudioServiceGuard {
                     boot.selected_microphone,
                     boot.selected_virtual_output,
                     boot.selected_monitor,
+                    initial_audio_error,
                 ));
                 run_audio_coordinator(boot.engine, global_volume, cmd_rx, thread_shared, bus);
             })
@@ -148,6 +153,7 @@ impl AudioServiceGuard {
             selected_microphone,
             selected_virtual_output,
             selected_monitor,
+            initial_audio_error,
         ) = init_rx.recv().unwrap_or_else(|_| {
             (
                 Vec::new(),
@@ -156,6 +162,7 @@ impl AudioServiceGuard {
                 String::new(),
                 String::new(),
                 String::new(),
+                None,
             )
         });
 
@@ -171,6 +178,7 @@ impl AudioServiceGuard {
             selected_microphone,
             selected_virtual_output,
             selected_monitor,
+            initial_audio_error,
         }
     }
 
@@ -325,6 +333,7 @@ fn run_audio_coordinator(
                 Ok(cmd) => Some(cmd),
                 Err(RecvTimeoutError::Timeout) => {
                     engine.reclaim_retired_buffers();
+                    forward_device_error(&mut engine, &shared, &bus);
                     None
                 }
                 Err(RecvTimeoutError::Disconnected) => break,
@@ -388,6 +397,7 @@ fn handle_audio_command(
             {
                 bus.send(DaemonEvent::AudioError(err));
             }
+            forward_device_error(engine, shared, bus);
         }
         AudioCommand::StopSlot(idx) => {
             engine.stop(idx);
@@ -405,6 +415,7 @@ fn handle_audio_command(
             {
                 bus.send(DaemonEvent::AudioError(err));
             }
+            forward_device_error(engine, shared, bus);
         }
         AudioCommand::UpdatePreview { volume, pitch } => {
             engine.update_preview(volume, pitch);
@@ -418,12 +429,21 @@ fn handle_audio_command(
         }
         AudioCommand::SetMicrophone(mic) => {
             engine.set_microphone(&mic);
+            if !forward_device_error(engine, shared, bus) {
+                notify_status_cleared(engine, shared, bus);
+            }
         }
         AudioCommand::SetVirtualOutput(out) => {
             engine.set_virtual_output(&out);
+            if !forward_device_error(engine, shared, bus) {
+                notify_status_cleared(engine, shared, bus);
+            }
         }
         AudioCommand::SetMonitorOutput(out) => {
             engine.set_monitor_output(&out);
+            if !forward_device_error(engine, shared, bus) {
+                notify_status_cleared(engine, shared, bus);
+            }
         }
         AudioCommand::SetMonitorVolume(vol) => {
             engine.set_monitor_volume(vol);
@@ -435,18 +455,51 @@ fn handle_audio_command(
             engine.clear_cache();
         }
         AudioCommand::RefreshDevices => {
+            // Revive any unplugged/faulted route before reporting the new lists.
+            engine.recover_missing_or_faulted();
             let (microphones, virtual_outputs, monitor_outputs) = engine.refresh_device_lists();
             bus.send(DaemonEvent::DevicesRefreshed {
                 microphones,
                 virtual_outputs,
                 monitor_outputs,
             });
+            if !forward_device_error(engine, shared, bus) {
+                notify_status_cleared(engine, shared, bus);
+            }
         }
         AudioCommand::InvalidateCachedFile(path) => {
             engine.invalidate_cached_file(&path);
         }
         AudioCommand::Shutdown => {}
     }
+}
+
+/// Surfaces a pending routing error to the UI while the window is open.
+/// Returns `true` when an error was sent.
+fn forward_device_error(
+    engine: &mut AudioEngine,
+    shared: &SharedAudioState,
+    bus: &DaemonSender,
+) -> bool {
+    if !shared.window_open.load(Ordering::Relaxed) {
+        return false;
+    }
+    match engine.take_pending_device_error() {
+        Some(err) => {
+            bus.send(DaemonEvent::AudioError(err));
+            true
+        }
+        None => false,
+    }
+}
+
+/// Tells the UI to clear a stale audio error after a clean device switch/refresh.
+fn notify_status_cleared(engine: &mut AudioEngine, shared: &SharedAudioState, bus: &DaemonSender) {
+    if !shared.window_open.load(Ordering::Relaxed) || engine.last_device_error.is_some() {
+        return;
+    }
+    engine.clear_device_error();
+    bus.send(DaemonEvent::AudioStatusCleared);
 }
 
 fn publish_and_notify(

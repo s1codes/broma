@@ -7,9 +7,15 @@ pub mod platform;
 pub mod service;
 
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
+use cpal::{ErrorKind, SampleFormat, SupportedBufferSize, SupportedStreamConfigRange};
+
+use crate::audio::mixer::StreamStatus;
 use crate::audio::{
     AudioEngine, DEVICE_DISABLED, DEVICE_SYSTEM_DEFAULT_MIC, DEVICE_SYSTEM_DEFAULT_OUTPUT,
+    RecoveryBackoff, decode_error_kind_label, encode_error_kind, is_fatal_stream_error,
+    select_best_supported_config,
 };
 use crate::tests::common::{AUDIO_SERVER_TEST_LOCK, build_test_wav};
 
@@ -111,4 +117,239 @@ fn recovers_automatically_when_wasapi_or_host_stream_faults() {
     } else {
         assert!(!boot.engine.recover_if_faulted());
     }
+}
+
+#[test]
+fn recovery_backoff_progresses_from_immediate_to_capped_delays() {
+    let t0 = Instant::now();
+    let mut backoff = RecoveryBackoff::new();
+
+    // First attempt after a fault is immediate.
+    assert!(backoff.can_attempt(t0));
+    backoff.record_attempt(t0);
+    assert!(!backoff.can_attempt(t0 + Duration::from_millis(249)));
+    assert!(backoff.can_attempt(t0 + Duration::from_millis(250)));
+
+    let t1 = t0 + Duration::from_millis(250);
+    backoff.record_attempt(t1);
+    assert!(!backoff.can_attempt(t1 + Duration::from_millis(499)));
+    assert!(backoff.can_attempt(t1 + Duration::from_millis(500)));
+
+    let t2 = t1 + Duration::from_millis(500);
+    backoff.record_attempt(t2);
+    assert!(!backoff.can_attempt(t2 + Duration::from_millis(999)));
+    assert!(backoff.can_attempt(t2 + Duration::from_millis(1_000)));
+
+    let t3 = t2 + Duration::from_millis(1_000);
+    backoff.record_attempt(t3);
+    assert!(!backoff.can_attempt(t3 + Duration::from_millis(1_999)));
+    assert!(backoff.can_attempt(t3 + Duration::from_millis(2_000)));
+
+    let t4 = t3 + Duration::from_millis(2_000);
+    backoff.record_attempt(t4);
+    assert!(
+        !backoff.can_attempt(t4 + Duration::from_millis(1_999)),
+        "backoff must cap at 2 s"
+    );
+    assert!(backoff.can_attempt(t4 + Duration::from_millis(2_000)));
+
+    backoff.reset();
+    assert!(backoff.can_attempt(t4), "reset restores immediate recovery");
+}
+
+#[test]
+fn recovery_backoff_forgets_failures_after_settle_window() {
+    let t0 = Instant::now();
+    let mut backoff = RecoveryBackoff::new();
+    backoff.record_attempt(t0);
+    backoff.record_attempt(t0);
+    assert!(!backoff.can_attempt(t0 + Duration::from_millis(250)));
+
+    let settled = t0 + Duration::from_secs(5);
+    assert!(backoff.can_attempt(settled));
+    backoff.record_attempt(settled);
+
+    // Treated as a first failure again, so the next wait is 250 ms, not 1000+.
+    assert!(!backoff.can_attempt(settled + Duration::from_millis(249)));
+    assert!(backoff.can_attempt(settled + Duration::from_millis(250)));
+}
+
+#[test]
+fn faulted_monitor_recovery_reports_error_once_and_respects_backoff() {
+    let _guard = AUDIO_SERVER_TEST_LOCK.lock().unwrap();
+    let mut boot = AudioEngine::bootstrap(
+        Some(DEVICE_DISABLED),
+        Some(DEVICE_DISABLED),
+        None,
+        0,
+        100,
+        100,
+    );
+
+    let Some(monitor) = &boot.engine.monitor else {
+        return;
+    };
+
+    monitor.status.last_error_code.store(
+        encode_error_kind(ErrorKind::StreamInvalidated),
+        Ordering::Relaxed,
+    );
+    monitor.status.stream_faulted.store(true, Ordering::Relaxed);
+
+    assert!(boot.engine.recover_if_faulted());
+    let reported = boot
+        .engine
+        .take_pending_device_error()
+        .expect("faulted stream must surface a diagnostic");
+    assert!(reported.contains("Monitor"), "got: {reported}");
+    assert!(reported.contains("StreamInvalidated"), "got: {reported}");
+    assert!(boot.engine.take_pending_device_error().is_none());
+
+    // Re-faulting immediately must be suppressed by the recovery backoff.
+    if let Some(reopened) = &boot.engine.monitor {
+        reopened
+            .status
+            .stream_faulted
+            .store(true, Ordering::Relaxed);
+        assert!(
+            !boot.engine.recover_if_faulted(),
+            "backoff must block a rapid repeat re-open"
+        );
+    }
+}
+
+#[test]
+fn non_fatal_stream_errors_do_not_fault_while_fatal_ones_do() {
+    assert!(!is_fatal_stream_error(ErrorKind::Xrun));
+    assert!(!is_fatal_stream_error(ErrorKind::DeviceChanged));
+    assert!(!is_fatal_stream_error(ErrorKind::RealtimeDenied));
+
+    let fatal_kinds = [
+        ErrorKind::DeviceNotAvailable,
+        ErrorKind::StreamInvalidated,
+        ErrorKind::HostUnavailable,
+        ErrorKind::DeviceBusy,
+        ErrorKind::PermissionDenied,
+        ErrorKind::ResourceExhausted,
+        ErrorKind::UnsupportedConfig,
+        ErrorKind::UnsupportedOperation,
+        ErrorKind::InvalidInput,
+        ErrorKind::BackendError,
+        ErrorKind::Other,
+    ];
+    for kind in fatal_kinds {
+        assert!(is_fatal_stream_error(kind), "expected {kind:?} to be fatal");
+    }
+}
+
+#[test]
+fn encode_and_decode_error_kind_round_trips_distinctly_for_fatal_kinds() {
+    let fatal_kinds = [
+        ErrorKind::DeviceNotAvailable,
+        ErrorKind::StreamInvalidated,
+        ErrorKind::HostUnavailable,
+        ErrorKind::DeviceBusy,
+        ErrorKind::PermissionDenied,
+        ErrorKind::ResourceExhausted,
+        ErrorKind::UnsupportedConfig,
+        ErrorKind::UnsupportedOperation,
+        ErrorKind::InvalidInput,
+        ErrorKind::BackendError,
+        ErrorKind::Other,
+    ];
+
+    let mut codes = std::collections::HashSet::new();
+    let mut labels = std::collections::HashSet::new();
+    for kind in fatal_kinds {
+        let code = encode_error_kind(kind);
+        assert_ne!(code, 0, "fatal kind {kind:?} must encode to non-zero");
+        assert!(codes.insert(code), "duplicate code {code} for {kind:?}");
+        let label = decode_error_kind_label(code);
+        assert!(!label.is_empty());
+        assert_ne!(label, "None");
+        assert_ne!(label, "Unknown");
+        assert!(labels.insert(label), "duplicate label {label}");
+    }
+
+    assert!(!decode_error_kind_label(0).is_empty());
+    assert!(!decode_error_kind_label(255).is_empty());
+}
+
+#[test]
+fn stream_status_last_error_code_defaults_to_zero_and_clears() {
+    let status = StreamStatus::default();
+    assert_eq!(status.last_error_code.load(Ordering::Relaxed), 0);
+
+    status.last_error_code.store(2, Ordering::Relaxed);
+    status.stream_faulted.store(true, Ordering::Relaxed);
+    status.clear();
+
+    assert_eq!(status.last_error_code.load(Ordering::Relaxed), 0);
+    assert!(!status.stream_faulted.load(Ordering::Relaxed));
+}
+
+#[test]
+fn select_best_supported_config_avoids_8khz_trap_and_ranks_rates_channels_formats() {
+    let buf = SupportedBufferSize::Unknown;
+    let wasapi_ranges = vec![
+        // Classic WASAPI trap: 8 kHz mono/stereo I16 appears first in the list.
+        SupportedStreamConfigRange::new(2, 8_000, 8_000, buf, SampleFormat::I16),
+        SupportedStreamConfigRange::new(1, 48_000, 48_000, buf, SampleFormat::F32),
+        SupportedStreamConfigRange::new(2, 44_100, 44_100, buf, SampleFormat::F32),
+        SupportedStreamConfigRange::new(2, 48_000, 48_000, buf, SampleFormat::I16),
+        SupportedStreamConfigRange::new(2, 48_000, 48_000, buf, SampleFormat::F32),
+    ];
+
+    let best_out = select_best_supported_config(wasapi_ranges.clone(), 2)
+        .expect("should pick a valid output config");
+    assert_eq!(best_out.sample_rate(), 48_000);
+    assert_eq!(best_out.channels(), 2);
+    assert_eq!(best_out.sample_format(), SampleFormat::F32);
+
+    let best_in =
+        select_best_supported_config(wasapi_ranges, 1).expect("should pick a valid input config");
+    assert_eq!(best_in.sample_rate(), 48_000);
+    assert_eq!(best_in.channels(), 1);
+    assert_eq!(best_in.sample_format(), SampleFormat::F32);
+
+    // Channel preference must outrank format preference: mono I16 wins for a
+    // mono mic request even though the stereo candidate is F32.
+    let channel_ranges = vec![
+        SupportedStreamConfigRange::new(2, 48_000, 48_000, buf, SampleFormat::F32),
+        SupportedStreamConfigRange::new(1, 48_000, 48_000, buf, SampleFormat::I16),
+    ];
+    let mono = select_best_supported_config(channel_ranges.clone(), 1).unwrap();
+    assert_eq!(mono.channels(), 1);
+    assert_eq!(mono.sample_format(), SampleFormat::I16);
+    let stereo = select_best_supported_config(channel_ranges, 2).unwrap();
+    assert_eq!(stereo.channels(), 2);
+    assert_eq!(stereo.sample_format(), SampleFormat::F32);
+
+    // When 48 kHz is absent, 44.1 kHz must beat 8 kHz even when 8 kHz comes first.
+    let no_48k_ranges = vec![
+        SupportedStreamConfigRange::new(2, 8_000, 8_000, buf, SampleFormat::F32),
+        SupportedStreamConfigRange::new(2, 44_100, 44_100, buf, SampleFormat::I16),
+    ];
+    let fallback =
+        select_best_supported_config(no_48k_ranges, 2).expect("should pick 44.1 kHz fallback");
+    assert_eq!(fallback.sample_rate(), 44_100);
+    assert_eq!(fallback.sample_format(), SampleFormat::I16);
+
+    // When neither 48 kHz nor 44.1 kHz is present, >= 44.1 kHz closer to 48 kHz beats >44.1 far
+    // and beats < 44.1 kHz.
+    let high_rate_ranges = vec![
+        SupportedStreamConfigRange::new(2, 32_000, 32_000, buf, SampleFormat::F32),
+        SupportedStreamConfigRange::new(2, 96_000, 96_000, buf, SampleFormat::F32),
+        SupportedStreamConfigRange::new(2, 88_200, 88_200, buf, SampleFormat::I16),
+    ];
+    let best_high = select_best_supported_config(high_rate_ranges, 2).unwrap();
+    assert_eq!(best_high.sample_rate(), 88_200);
+
+    // Below 44.1 kHz, higher rate wins over 8 kHz.
+    let low_rate_ranges = vec![
+        SupportedStreamConfigRange::new(2, 8_000, 8_000, buf, SampleFormat::F32),
+        SupportedStreamConfigRange::new(2, 32_000, 32_000, buf, SampleFormat::I16),
+    ];
+    let best_low = select_best_supported_config(low_rate_ranges, 2).unwrap();
+    assert_eq!(best_low.sample_rate(), 32_000);
 }

@@ -13,16 +13,16 @@
 //! - Pushes into a pre-allocated `rtrb::Producer<f32>` without locks, allocations, or I/O.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use cpal::traits::{DeviceTrait, StreamTrait};
-use cpal::{
-    BufferSize, Device, SampleFormat, Stream, StreamConfig, SupportedBufferSize,
-    SupportedStreamConfig,
-};
+#[cfg(not(target_os = "windows"))]
+use cpal::{BufferSize, SupportedBufferSize};
+use cpal::{Device, SampleFormat, Stream, StreamConfig, SupportedStreamConfig};
 use rtrb::{Consumer, Producer, RingBuffer};
 
 /// Target low-latency capture callback size (~5.3 ms at 48 kHz).
+#[cfg(not(target_os = "windows"))]
 const PREFERRED_INPUT_BUFFER_FRAMES: u32 = 256;
 
 /// Pre-allocated ring capacity (~340 ms at 48 kHz); mixer trims drift above ~30 ms.
@@ -38,11 +38,16 @@ pub struct MicPassthroughConsumer {
 pub struct MicBridge {
     _stream: Stream,
     faulted: Arc<AtomicBool>,
+    last_error_code: Arc<AtomicU8>,
 }
 
 impl MicBridge {
     pub fn is_faulted(&self) -> bool {
-        self.faulted.load(Ordering::Relaxed)
+        self.faulted.load(Ordering::Acquire)
+    }
+
+    pub fn last_error_code(&self) -> u8 {
+        self.last_error_code.load(Ordering::Relaxed)
     }
 
     /// Opens a low-latency capture stream on `mic_device` and returns both the
@@ -53,31 +58,48 @@ impl MicBridge {
         let sample_rate = supported.sample_rate();
         let channels = supported.channels();
 
-        let mut low_latency_cfg: StreamConfig = supported.into();
-        if let SupportedBufferSize::Range { min, max } = supported.buffer_size() {
-            let frames = PREFERRED_INPUT_BUFFER_FRAMES.clamp(*min, *max);
-            low_latency_cfg.buffer_size = BufferSize::Fixed(frames);
+        #[cfg(target_os = "windows")]
+        {
+            // Keep `BufferSize::Default` on WASAPI so Windows allocates its safe
+            // multi-period shared-mode buffer instead of a tight 1-period capture buffer.
+            let default_cfg: StreamConfig = supported.into();
+            build_input_stream(
+                &mic_device,
+                default_cfg,
+                sample_format,
+                channels,
+                sample_rate,
+            )
         }
 
-        match build_input_stream(
-            &mic_device,
-            low_latency_cfg,
-            sample_format,
-            channels,
-            sample_rate,
-        ) {
-            Ok(pair) => Ok(pair),
-            Err(_) if low_latency_cfg.buffer_size != BufferSize::Default => {
-                let default_cfg: StreamConfig = supported.into();
-                build_input_stream(
-                    &mic_device,
-                    default_cfg,
-                    sample_format,
-                    channels,
-                    sample_rate,
-                )
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut low_latency_cfg: StreamConfig = supported.into();
+            if let SupportedBufferSize::Range { min, max } = supported.buffer_size() {
+                let frames = PREFERRED_INPUT_BUFFER_FRAMES.clamp(*min, *max);
+                low_latency_cfg.buffer_size = BufferSize::Fixed(frames);
             }
-            Err(err) => Err(err),
+
+            match build_input_stream(
+                &mic_device,
+                low_latency_cfg,
+                sample_format,
+                channels,
+                sample_rate,
+            ) {
+                Ok(pair) => Ok(pair),
+                Err(_) if low_latency_cfg.buffer_size != BufferSize::Default => {
+                    let default_cfg: StreamConfig = supported.into();
+                    build_input_stream(
+                        &mic_device,
+                        default_cfg,
+                        sample_format,
+                        channels,
+                        sample_rate,
+                    )
+                }
+                Err(err) => Err(err),
+            }
         }
     }
 }
@@ -96,25 +118,8 @@ fn select_input_config(device: &Device) -> Result<SupportedStreamConfig, String>
         .supported_input_configs()
         .map_err(|e| format!("Failed to query microphone configs: {e}"))?;
 
-    let mut best = None;
-    for range in ranges {
-        if !matches!(
-            range.sample_format(),
-            SampleFormat::F32 | SampleFormat::I16 | SampleFormat::U16
-        ) {
-            continue;
-        }
-        let rate = 48_000.clamp(range.min_sample_rate(), range.max_sample_rate());
-        let candidate = range.with_sample_rate(rate);
-        if candidate.channels() == 1 {
-            return Ok(candidate);
-        }
-        if best.is_none() {
-            best = Some(candidate);
-        }
-    }
-
-    best.ok_or_else(|| "No supported PCM capture format on microphone".to_string())
+    crate::audio::select_best_supported_config(ranges, 1)
+        .ok_or_else(|| "No supported PCM capture format on microphone".to_string())
 }
 
 fn build_input_stream(
@@ -128,11 +133,17 @@ fn build_input_stream(
     let ch = usize::from(channels.max(1));
     let inv_ch = 1.0 / (ch as f32);
     let faulted = Arc::new(AtomicBool::new(false));
+    let last_error_code = Arc::new(AtomicU8::new(0));
     let err_flag = Arc::clone(&faulted);
+    let err_code = Arc::clone(&last_error_code);
 
     // Lock-free fault flag records WASAPI/device invalidation without allocating (`AGENTS.md` §5).
-    let err_fn = move |_err| {
-        err_flag.store(true, Ordering::Relaxed);
+    let err_fn = move |err: cpal::Error| {
+        let kind = err.kind();
+        if crate::audio::is_fatal_stream_error(kind) {
+            err_code.store(crate::audio::encode_error_kind(kind), Ordering::Relaxed);
+            err_flag.store(true, Ordering::Release);
+        }
     };
 
     let stream = match sample_format {
@@ -171,6 +182,7 @@ fn build_input_stream(
         MicBridge {
             _stream: stream,
             faulted,
+            last_error_code,
         },
         MicPassthroughConsumer { rx, sample_rate },
     ))
