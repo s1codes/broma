@@ -2,10 +2,16 @@ name: CI
 
 on:
   push:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - '.github/**'
+      - 'assets/**'
     branches:
       - '**'
   pull_request: {}
   workflow_dispatch: {}
+
 
 permissions:
   contents: read
